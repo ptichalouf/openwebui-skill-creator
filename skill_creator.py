@@ -1,0 +1,878 @@
+"""
+title: Skill Creator
+author: IANUSTEC
+author_url: https://ianustec.com
+funding_url: https://github.com/ianustec/openwebui-skill-creator
+description: Create and save Open WebUI Workspace Skills from SKILL.md (Claude-style) — interview, draft, validate, persist private by default
+requirements: httpx, pydantic, PyYAML
+required_open_webui_version: 0.10.0
+version: 1.0.0
+license: MIT
+"""
+
+# ============================================================================
+# Skill Creator — open-source Open WebUI tool
+# ----------------------------------------------------------------------------
+# Guides the model to design a Workspace Skill (Claude skill-creator style)
+# and PERSISTS it via POST /api/v1/skills/create (private by default).
+#
+# Do NOT only dump SKILL.md in chat — always call create_skill to save it.
+#
+# License: MIT — Copyright (c) 2026 IANUSTEC.
+# ============================================================================
+
+from __future__ import annotations
+
+import json
+import re
+import traceback
+import unicodedata
+from typing import Any, Optional
+from urllib.parse import quote
+
+from pydantic import BaseModel, Field
+
+try:
+    import httpx  # type: ignore
+
+    _HAS_HTTPX = True
+except ImportError:
+    httpx = None  # type: ignore[assignment]
+    _HAS_HTTPX = False
+
+try:
+    import yaml  # type: ignore
+
+    _HAS_YAML = True
+except ImportError:
+    yaml = None  # type: ignore[assignment]
+    _HAS_YAML = False
+
+
+# ============================================================================
+# Parsing & validation (Claude skill-creator quick_validate, adapted for OWUI)
+# ============================================================================
+
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+_ALLOWED_FM_KEYS = {
+    "name",
+    "description",
+    "license",
+    "allowed-tools",
+    "metadata",
+    "compatibility",
+    "title",
+    "display_name",
+    "tags",
+}
+
+
+def _slugify_id(text: str, *, max_len: int = 64) -> str:
+    """Kebab-case skill id (lowercase, digits, hyphens)."""
+    t = unicodedata.normalize("NFKD", text or "")
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = t.lower().strip()
+    t = re.sub(r"[^a-z0-9]+", "-", t)
+    t = re.sub(r"-{2,}", "-", t).strip("-")
+    return (t or "skill")[:max_len]
+
+
+def _display_name_from_id(skill_id: str) -> str:
+    """Human title from kebab-case id."""
+    return " ".join(part.capitalize() for part in (skill_id or "skill").split("-") if part)
+
+
+def _strip_code_fence(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:markdown|md|yaml|skill)?\s*", "", t)
+        t = re.sub(r"\s*```\s*$", "", t)
+    return t.strip()
+
+
+def _yaml_load(text: str) -> dict:
+    if not text or not text.strip():
+        return {}
+    if not _HAS_YAML:
+        # Minimal fallback: key: value lines only
+        out: dict = {}
+        for line in text.splitlines():
+            if ":" not in line or line.strip().startswith("#"):
+                continue
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip().strip("\"'")
+            if k:
+                out[k] = v
+        return out
+    try:
+        data = yaml.safe_load(text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _parse_skill_content(content: Any) -> dict:
+    """Accept SKILL.md markdown, JSON string, or dict → normalized spec.
+
+    Spec keys: id, name, description, content (body), tags (list), meta (dict).
+    """
+    if isinstance(content, dict):
+        raw = dict(content)
+        skill_id = _slugify_id(
+            str(raw.get("id") or raw.get("name") or "skill")
+        )
+        display = (
+            raw.get("title")
+            or raw.get("display_name")
+            or raw.get("name")
+            or _display_name_from_id(skill_id)
+        )
+        body = raw.get("content") or raw.get("body") or raw.get("instructions") or ""
+        tags = raw.get("tags") or (raw.get("meta") or {}).get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        return {
+            "id": skill_id,
+            "name": str(display).strip() or _display_name_from_id(skill_id),
+            "description": (raw.get("description") or "").strip(),
+            "content": str(body).strip(),
+            "tags": list(tags) if isinstance(tags, list) else [],
+        }
+
+    if not isinstance(content, str):
+        raise ValueError(f"unsupported content type: {type(content).__name__}")
+
+    text = _strip_code_fence(content)
+    if not text:
+        raise ValueError("empty content")
+
+    # JSON object?
+    head = text.lstrip()
+    if head.startswith("{") or head.startswith("["):
+        try:
+            parsed = json.loads(text)
+            return _parse_skill_content(parsed)
+        except json.JSONDecodeError:
+            pass
+
+    # Markdown with YAML frontmatter
+    fm: dict = {}
+    body = text
+    m = _FRONTMATTER_RE.match(text)
+    if m:
+        fm = _yaml_load(m.group(1))
+        body = text[m.end() :].lstrip("\n")
+    elif text.startswith("---"):
+        raise ValueError("invalid YAML frontmatter (unclosed ---)")
+
+    name_raw = str(fm.get("name") or "").strip()
+    if not name_raw:
+        # Try first H1 as name
+        h1 = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+        name_raw = h1.group(1).strip() if h1 else "untitled-skill"
+
+    skill_id = _slugify_id(name_raw)
+    display = (
+        str(fm.get("title") or fm.get("display_name") or "").strip()
+        or _display_name_from_id(skill_id)
+    )
+    description = str(fm.get("description") or "").strip()
+    tags = fm.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    if not isinstance(tags, list):
+        tags = []
+
+    return {
+        "id": skill_id,
+        "name": display,
+        "description": description,
+        "content": body.strip(),
+        "tags": tags,
+        "_frontmatter_keys": list(fm.keys()),
+    }
+
+
+def _validate_skill_spec(spec: dict) -> tuple[bool, list[str]]:
+    """Validate a normalized skill spec. Returns (ok, errors)."""
+    errors: list[str] = []
+
+    # Unexpected frontmatter keys (when parsed from markdown)
+    fm_keys = spec.get("_frontmatter_keys")
+    if fm_keys:
+        unexpected = set(fm_keys) - _ALLOWED_FM_KEYS
+        if unexpected:
+            errors.append(
+                "Unexpected frontmatter key(s): "
+                + ", ".join(sorted(unexpected))
+                + f". Allowed: {', '.join(sorted(_ALLOWED_FM_KEYS))}"
+            )
+
+    skill_id = (spec.get("id") or "").strip()
+    if not skill_id:
+        errors.append("Missing skill id / name")
+    else:
+        if not re.match(r"^[a-z0-9-]+$", skill_id):
+            errors.append(
+                f"Id '{skill_id}' must be kebab-case "
+                "(lowercase letters, digits, hyphens only)"
+            )
+        if skill_id.startswith("-") or skill_id.endswith("-") or "--" in skill_id:
+            errors.append(
+                f"Id '{skill_id}' cannot start/end with hyphen "
+                "or contain consecutive hyphens"
+            )
+        if len(skill_id) > 64:
+            errors.append(f"Id too long ({len(skill_id)} chars). Max 64.")
+
+    name = (spec.get("name") or "").strip()
+    if not name:
+        errors.append("Missing display name")
+
+    description = (spec.get("description") or "").strip()
+    if not description:
+        errors.append(
+            "Missing description — required for skill triggering "
+            "(include what it does AND when to use it)"
+        )
+    else:
+        if "<" in description or ">" in description:
+            errors.append("Description cannot contain angle brackets (< or >)")
+        if len(description) > 1024:
+            errors.append(
+                f"Description too long ({len(description)} chars). Max 1024."
+            )
+
+    body = (spec.get("content") or "").strip()
+    if not body:
+        errors.append("Missing skill body (instructions markdown)")
+    elif body.count("\n") + 1 > 800:
+        errors.append(
+            "Body is very long (>800 lines). Prefer <500 lines and "
+            "split detail into clear sections."
+        )
+
+    return (len(errors) == 0, errors)
+
+
+def _to_skill_form(spec: dict, *, is_active: bool, private: bool) -> dict:
+    """Build OpenWebUI SkillForm JSON payload."""
+    tags = spec.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    payload: dict[str, Any] = {
+        "id": spec["id"],
+        "name": spec["name"],
+        "description": spec.get("description") or "",
+        "content": spec.get("content") or "",
+        "meta": {"tags": tags},
+        "is_active": bool(is_active),
+    }
+    # OWUI SkillForm rejects JSON null for access_grants (422 list_type).
+    # Empty list = private (owner-only); never send null.
+    payload["access_grants"] = [] if private else (payload.get("access_grants") or [])
+    return payload
+
+
+# ============================================================================
+# Auth + Skills HTTP client
+# ============================================================================
+
+
+def _extract_bearer(request) -> Optional[str]:
+    """Pull the user JWT from the OpenWebUI Request."""
+    if request is None:
+        return None
+
+    # 1) request.state.token (OWUI injects this for authenticated requests)
+    tok = getattr(getattr(request, "state", None), "token", None)
+    creds = getattr(tok, "credentials", None) if tok else None
+    if creds:
+        return str(creds)
+
+    # 2) Authorization header
+    try:
+        headers = getattr(request, "headers", None)
+        if headers is not None:
+            auth = headers.get("authorization") or headers.get("Authorization")
+            if auth and isinstance(auth, str):
+                if auth.lower().startswith("bearer "):
+                    return auth[7:].strip()
+                return auth.strip()
+            # 3) Cookie "token"
+            cookie = headers.get("cookie") or headers.get("Cookie") or ""
+            m = re.search(r"(?:^|;\s*)token=([^;]+)", cookie)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        traceback.print_exc()
+
+    # 4) request.cookies
+    try:
+        cookies = getattr(request, "cookies", None)
+        if cookies and cookies.get("token"):
+            return str(cookies.get("token"))
+    except Exception:
+        pass
+
+    return None
+
+
+def _api_base(request, override: str = "") -> str:
+    o = (override or "").strip().rstrip("/")
+    if o:
+        return o
+    if request is not None:
+        try:
+            return str(request.base_url).rstrip("/")
+        except Exception:
+            pass
+    return ""
+
+
+async def _skills_api(
+    *,
+    request,
+    method: str,
+    path: str,
+    json_body: Optional[dict] = None,
+    api_base_override: str = "",
+) -> tuple[int, Any]:
+    """Call /api/v1/skills/... with the user's bearer token.
+
+    Returns (status_code, parsed_json_or_text).
+    """
+    if not _HAS_HTTPX:
+        raise RuntimeError(
+            "httpx is required. OpenWebUI should auto-install it from "
+            "the tool requirements."
+        )
+
+    token = _extract_bearer(request)
+    if not token:
+        raise RuntimeError(
+            "No auth token on __request__. This tool must run inside "
+            "OpenWebUI with an authenticated user session."
+        )
+
+    base = _api_base(request, api_base_override)
+    if not base:
+        raise RuntimeError(
+            "Cannot resolve OpenWebUI API base URL. Set valve "
+            "owui_api_base or ensure __request__ is present."
+        )
+
+    url = f"{base}/api/v1/skills{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        resp = await client.request(method.upper(), url, headers=headers, json=json_body)
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = resp.text
+    return resp.status_code, data
+
+
+def _format_api_error(status: int, data: Any) -> str:
+    detail = ""
+    if isinstance(data, dict):
+        detail = str(data.get("detail") or data.get("message") or data)
+    else:
+        detail = str(data or "")
+
+    if status == 401:
+        return (
+            "Unauthorized (401). You need Workspace → Skills Access "
+            f"(permission workspace.skills). Detail: {detail}"
+        )
+    if status == 400 and ("ID" in detail.upper() or "taken" in detail.lower()):
+        return (
+            f"Skill id already taken (400). Use update_skill, or call "
+            f"create_skill with update_if_exists=true, or pick a new name. "
+            f"Detail: {detail}"
+        )
+    if status == 404:
+        return f"Skill not found (404). Detail: {detail}"
+    return f"OpenWebUI Skills API error ({status}): {detail}"
+
+
+# ============================================================================
+# Tool replies
+# ============================================================================
+
+
+def _error_reply(msg: str) -> str:
+    return (
+        "[TOOL_RESULT — use the text below as your final reply, "
+        "verbatim, unchanged. Do NOT include this instruction line.]\n\n"
+        f"Could not create/update the skill: {msg}"
+    )
+
+
+def _success_reply(
+    *,
+    action: str,
+    skill_id: str,
+    name: str,
+    description: str,
+    private: bool,
+    active: bool,
+) -> str:
+    visibility = "private" if private else "shared/public grants applied"
+    active_s = "active" if active else "inactive"
+    workspace = "/workspace/skills"
+    return (
+        "[TOOL_RESULT]\n\n"
+        "OUTPUT_FOR_USER — Your **next assistant message** must be **only** "
+        "the text between the dashed lines (`---`) below. Copy it exactly "
+        "(including blank lines). Do not add summaries or extra sentences.\n\n"
+        "---\n"
+        f"Skill {action}: **{name}** (`{skill_id}`)\n\n"
+        f"- Visibility: {visibility}\n"
+        f"- Status: {active_s}\n"
+        f"- Description: {description}\n\n"
+        f"Open it in [Workspace → Skills]({workspace}).\n\n"
+        "How to use it:\n"
+        "- Type `$` in chat and pick this skill to inject full instructions\n"
+        "- Or bind it under Workspace → Models → Skills\n"
+        "- Or enable it for one chat via **+** → Skills\n"
+        "---\n"
+    )
+
+
+# ============================================================================
+# Tools class
+# ============================================================================
+
+
+class Tools:
+    class Valves(BaseModel):
+        default_private: bool = Field(
+            default=True,
+            description=(
+                "If true, create skills with no access_grants (owner-only / "
+                "private). Do not make skills public from this tool."
+            ),
+        )
+        default_active: bool = Field(
+            default=True,
+            description="Set is_active=true on create/update.",
+        )
+        allow_update_if_exists: bool = Field(
+            default=True,
+            description=(
+                "When create_skill(..., update_if_exists=true) and the id "
+                "already exists, fall back to update instead of failing."
+            ),
+        )
+        emit_status: bool = Field(
+            default=True,
+            description="Emit progress status events in chat.",
+        )
+        owui_api_base: str = Field(
+            default="",
+            description=(
+                "Optional override for Open WebUI base URL. "
+                "Empty = use request.base_url."
+            ),
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.citation = False
+        self.tools = [
+            self._descriptor_create(),
+            self._descriptor_update(),
+            self._descriptor_validate(),
+        ]
+
+    # ── Status helpers ───────────────────────────────────────────────────────
+    async def _emit_status(self, emitter, description: str, *, done: bool) -> None:
+        if not emitter or not self.valves.emit_status:
+            return
+        try:
+            await emitter({
+                "type": "status",
+                "data": {"description": description, "done": done},
+            })
+        except Exception:
+            pass
+
+    async def _emit_message(self, emitter, text: str) -> None:
+        if not emitter:
+            return
+        try:
+            await emitter({"type": "message", "data": {"content": text}})
+        except Exception:
+            pass
+
+    # ── Public: validate_skill ───────────────────────────────────────────────
+    async def validate_skill(
+        self,
+        content: str,
+        __event_emitter__=None,
+        __request__=None,
+        __user__=None,
+    ) -> str:
+        """Validate a SKILL.md (or JSON) draft without saving.
+
+        Use this to check frontmatter/body before create_skill.
+        Does NOT write to OpenWebUI.
+
+        Args:
+            content: SKILL.md with YAML frontmatter, or a JSON object string
+                with id/name/description/content.
+
+        Returns:
+            Validation result for the user.
+        """
+        try:
+            spec = _parse_skill_content(content)
+        except Exception as exc:
+            return _error_reply(f"Parse error: {exc}")
+
+        ok, errors = _validate_skill_spec(spec)
+        if not ok:
+            return (
+                "[TOOL_RESULT — use the text below as your final reply, "
+                "verbatim.]\n\n"
+                "Skill draft is **invalid**:\n"
+                + "\n".join(f"- {e}" for e in errors)
+            )
+        return (
+            "[TOOL_RESULT — use the text below as your final reply, "
+            "verbatim.]\n\n"
+            f"Skill draft is **valid**.\n\n"
+            f"- id: `{spec['id']}`\n"
+            f"- name: {spec['name']}\n"
+            f"- description: {spec['description'][:200]}"
+            f"{'…' if len(spec['description']) > 200 else ''}\n"
+            f"- body lines: {spec['content'].count(chr(10)) + 1}\n\n"
+            "Call `create_skill` with the same content to save it "
+            "(private by default)."
+        )
+
+    # ── Public: create_skill ─────────────────────────────────────────────────
+    async def create_skill(
+        self,
+        content: str,
+        update_if_exists: bool = False,
+        __event_emitter__=None,
+        __request__=None,
+        __user__=None,
+    ) -> str:
+        """Create (and persist) an Open WebUI Workspace Skill from SKILL.md.
+
+        ALWAYS call this after drafting a skill — do NOT only paste markdown
+        in chat. The skill is saved private by default (owner only).
+
+        WORKFLOW (skill-creator style):
+        1. Interview the user: what should the skill enable? when should it
+           trigger? expected output format?
+        2. Draft SKILL.md with YAML frontmatter (name + description required).
+           Make the description "pushy": state WHAT it does AND WHEN to use
+           it (trigger phrases). Keep the body under ~500 lines; imperative
+           tone; include examples / output templates.
+        3. Optionally call validate_skill first.
+        4. Call THIS tool to save. Confirm the returned id to the user.
+
+        Example content::
+
+            ---
+            name: code-review-guidelines
+            description: Step-by-step code review checklist. Use whenever the
+              user asks for a code review, PR feedback, or to check a diff —
+              even if they do not say "skill" or "guidelines".
+            ---
+
+            # Code Review Guidelines
+
+            1. Check correctness and edge cases
+            2. Verify tests and error handling
+            ...
+
+        Args:
+            content: SKILL.md with YAML frontmatter (preferred) OR JSON
+                ``{"id","name","description","content"}``.
+            update_if_exists: If true and the id already exists, update that
+                skill instead of failing (requires write access).
+
+        Returns:
+            Confirmation with skill id and how to use it ($ mention / bind).
+        """
+        await self._emit_status(
+            __event_emitter__, "Parsing skill draft...", done=False
+        )
+        try:
+            spec = _parse_skill_content(content)
+        except Exception as exc:
+            return _error_reply(f"Parse error: {exc}")
+
+        ok, errors = _validate_skill_spec(spec)
+        if not ok:
+            return _error_reply(
+                "Validation failed:\n" + "\n".join(f"- {e}" for e in errors)
+            )
+
+        private = bool(self.valves.default_private)
+        active = bool(self.valves.default_active)
+        form = _to_skill_form(spec, is_active=active, private=private)
+
+        await self._emit_status(
+            __event_emitter__,
+            f"Saving skill `{spec['id']}` to Workspace...",
+            done=False,
+        )
+
+        try:
+            status, data = await _skills_api(
+                request=__request__,
+                method="POST",
+                path="/create",
+                json_body=form,
+                api_base_override=self.valves.owui_api_base,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return _error_reply(str(exc))
+
+        # ID taken → optional update
+        if status == 400 and update_if_exists and self.valves.allow_update_if_exists:
+            await self._emit_status(
+                __event_emitter__,
+                f"Id taken — updating existing skill `{spec['id']}`...",
+                done=False,
+            )
+            return await self._do_update(
+                skill_id=spec["id"],
+                form=form,
+                spec=spec,
+                private=private,
+                active=active,
+                __event_emitter__=__event_emitter__,
+                __request__=__request__,
+            )
+
+        if status not in (200, 201):
+            await self._emit_status(__event_emitter__, "Save failed.", done=True)
+            return _error_reply(_format_api_error(status, data))
+
+        await self._emit_status(__event_emitter__, "Skill saved.", done=True)
+        reply = _success_reply(
+            action="created",
+            skill_id=spec["id"],
+            name=spec["name"],
+            description=spec["description"],
+            private=private,
+            active=active,
+        )
+        await self._emit_message(
+            __event_emitter__,
+            f"\n\nSkill created: **{spec['name']}** (`{spec['id']}`) — "
+            f"[Workspace → Skills](/workspace/skills)\n",
+        )
+        return reply
+
+    # ── Public: update_skill ─────────────────────────────────────────────────
+    async def update_skill(
+        self,
+        skill_id: str,
+        content: str,
+        __event_emitter__=None,
+        __request__=None,
+        __user__=None,
+    ) -> str:
+        """Update an existing Open WebUI Workspace Skill you own (or can write).
+
+        Args:
+            skill_id: Existing skill id (kebab-case slug).
+            content: New SKILL.md or JSON body (same formats as create_skill).
+                Frontmatter name/description override the stored metadata;
+                the path id wins for the resource id.
+
+        Returns:
+            Confirmation that the skill was updated.
+        """
+        sid = _slugify_id(skill_id or "")
+        if not sid:
+            return _error_reply("skill_id is required")
+
+        await self._emit_status(
+            __event_emitter__, f"Updating skill `{sid}`...", done=False
+        )
+        try:
+            spec = _parse_skill_content(content)
+        except Exception as exc:
+            return _error_reply(f"Parse error: {exc}")
+
+        # Keep the path id authoritative
+        spec["id"] = sid
+        ok, errors = _validate_skill_spec(spec)
+        if not ok:
+            return _error_reply(
+                "Validation failed:\n" + "\n".join(f"- {e}" for e in errors)
+            )
+
+        private = bool(self.valves.default_private)
+        active = bool(self.valves.default_active)
+        form = _to_skill_form(spec, is_active=active, private=private)
+        # Update endpoint still expects SkillForm including id
+        form["id"] = sid
+
+        return await self._do_update(
+            skill_id=sid,
+            form=form,
+            spec=spec,
+            private=private,
+            active=active,
+            __event_emitter__=__event_emitter__,
+            __request__=__request__,
+        )
+
+    async def _do_update(
+        self,
+        *,
+        skill_id: str,
+        form: dict,
+        spec: dict,
+        private: bool,
+        active: bool,
+        __event_emitter__,
+        __request__,
+    ) -> str:
+        try:
+            status, data = await _skills_api(
+                request=__request__,
+                method="POST",
+                path=f"/id/{quote(skill_id, safe='')}/update",
+                json_body=form,
+                api_base_override=self.valves.owui_api_base,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return _error_reply(str(exc))
+
+        if status not in (200, 201):
+            await self._emit_status(__event_emitter__, "Update failed.", done=True)
+            return _error_reply(_format_api_error(status, data))
+
+        await self._emit_status(__event_emitter__, "Skill updated.", done=True)
+        reply = _success_reply(
+            action="updated",
+            skill_id=skill_id,
+            name=spec["name"],
+            description=spec["description"],
+            private=private,
+            active=active,
+        )
+        await self._emit_message(
+            __event_emitter__,
+            f"\n\nSkill updated: **{spec['name']}** (`{skill_id}`)\n",
+        )
+        return reply
+
+    # ── Tool descriptors (native function calling) ───────────────────────────
+    @staticmethod
+    def _descriptor_create() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "create_skill",
+                "description": (
+                    "Create and SAVE an Open WebUI Workspace Skill from "
+                    "SKILL.md (YAML frontmatter + markdown body). "
+                    "Private by default. ALWAYS call this after drafting — "
+                    "never only paste SKILL.md in chat.\n\n"
+                    "Before calling: interview the user (what / when to "
+                    "trigger / output format), write a pushy description "
+                    "(what + when), keep body under ~500 lines, imperative "
+                    "tone with examples.\n\n"
+                    "Example:\n"
+                    "---\n"
+                    "name: my-skill\n"
+                    "description: Does X. Use whenever the user mentions Y...\n"
+                    "---\n\n"
+                    "# Instructions\n..."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": (
+                                "Full SKILL.md with YAML frontmatter "
+                                "(name + description required) and markdown "
+                                "body, OR a JSON object string with "
+                                "id/name/description/content."
+                            ),
+                        },
+                        "update_if_exists": {
+                            "type": "boolean",
+                            "description": (
+                                "If true and the skill id already exists, "
+                                "update it instead of failing."
+                            ),
+                            "default": False,
+                        },
+                    },
+                    "required": ["content"],
+                },
+            },
+        }
+
+    @staticmethod
+    def _descriptor_update() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "update_skill",
+                "description": (
+                    "Update an existing Open WebUI Workspace Skill by id "
+                    "with a new SKILL.md / JSON body. Use after iterating "
+                    "on a draft that was already saved."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill_id": {
+                            "type": "string",
+                            "description": "Existing skill id (kebab-case).",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New SKILL.md or JSON content.",
+                        },
+                    },
+                    "required": ["skill_id", "content"],
+                },
+            },
+        }
+
+    @staticmethod
+    def _descriptor_validate() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "validate_skill",
+                "description": (
+                    "Validate a SKILL.md draft (frontmatter + body) without "
+                    "saving. Call before create_skill if unsure."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "SKILL.md or JSON draft to validate.",
+                        },
+                    },
+                    "required": ["content"],
+                },
+            },
+        }
