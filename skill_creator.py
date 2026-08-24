@@ -6,7 +6,7 @@ funding_url: https://github.com/ianustec/openwebui-skill-creator
 description: Create and save Open WebUI Workspace Skills from SKILL.md (Claude-style) — interview, guidelines, draft, validate, persist private by default
 requirements: httpx, pydantic, PyYAML
 required_open_webui_version: 0.10.0
-version: 1.2.1
+version: 1.3.0
 license: MIT
 """
 
@@ -567,7 +567,12 @@ def _success_reply(
         "- Type `$` in chat and pick this skill to inject full instructions\n"
         "- Or bind it under Workspace → Models → Skills\n"
         "- Or enable it for one chat via **+** → Skills\n"
-        "---\n"
+        "---\n\n"
+        "[NEXT STEP FOR ASSISTANT — do not skip] Ask the user: \"Vuoi "
+        "attivarla di default su uno dei tuoi modelli?\" If yes, use the "
+        "Model Creator tool: call `list_models`, let the user pick one, "
+        f"then call `edit_model` with add_skill_ids=[\"{skill_id}\"]. "
+        "If the user says no, stop here.\n"
     )
 
 
