@@ -6,7 +6,7 @@ funding_url: https://github.com/ianustec/openwebui-skill-creator
 description: Create and save Open WebUI Workspace Skills from SKILL.md (Claude-style) — interview, guidelines, draft, validate, persist private by default
 requirements: httpx, pydantic, PyYAML
 required_open_webui_version: 0.10.0
-version: 1.1.0
+version: 1.2.0
 license: MIT
 """
 
@@ -587,6 +587,15 @@ class Tools:
                 "already exists, fall back to update instead of failing."
             ),
         )
+        enforce_guidelines: bool = Field(
+            default=True,
+            description=(
+                "Quality gate: if the draft is missing recommended sections "
+                "(purpose, procedure, output format, examples, edge cases), "
+                "create_skill returns the writing guidelines and asks for a "
+                "better draft instead of saving. Pass force=true to bypass."
+            ),
+        )
         emit_status: bool = Field(
             default=True,
             description="Emit progress status events in chat.",
@@ -708,6 +717,7 @@ class Tools:
         self,
         content: str,
         update_if_exists: bool = False,
+        force: bool = False,
         __event_emitter__=None,
         __request__=None,
         __user__=None,
@@ -759,9 +769,12 @@ class Tools:
                 ``{"id","name","description","content"}``.
             update_if_exists: If true and the id already exists, update that
                 skill instead of failing (requires write access).
+            force: Bypass the quality gate (save even if the draft is
+                missing recommended sections).
 
         Returns:
-            Confirmation with skill id and how to use it ($ mention / bind).
+            Confirmation with skill id and how to use it ($ mention / bind),
+            or the writing guidelines if the draft is too schematic.
         """
         await self._emit_status(
             __event_emitter__, "Parsing skill draft...", done=False
@@ -775,6 +788,26 @@ class Tools:
         if not ok:
             return _error_reply(
                 "Validation failed:\n" + "\n".join(f"- {e}" for e in errors)
+            )
+
+        # Quality gate: a schematic draft is NOT saved — the model must load
+        # the guidelines and improve it first (or explicitly force).
+        if warnings and self.valves.enforce_guidelines and not force:
+            await self._emit_status(
+                __event_emitter__,
+                "Draft too schematic — returning guidelines...",
+                done=True,
+            )
+            return (
+                "[TOOL_RESULT — the skill was NOT saved. Improve the draft "
+                "using the guidelines below, then call create_skill again "
+                "with the improved content. Tell the user briefly what you "
+                "are adding. Only use force=true if the user explicitly "
+                "asked for a minimal skill.]\n\n"
+                "The draft is missing recommended sections:\n"
+                + "\n".join(f"- {w}" for w in warnings)
+                + "\n\n"
+                + _SKILL_GUIDELINES
             )
 
         private = bool(self.valves.default_private)
@@ -954,17 +987,18 @@ class Tools:
                     "SKILL.md (YAML frontmatter + markdown body). "
                     "Private by default. ALWAYS call this after drafting — "
                     "never only paste SKILL.md in chat.\n\n"
-                    "WORKFLOW: (1) interview the user — what it does, when "
-                    "to trigger, output format, edge cases; (2) call "
-                    "get_skill_guidelines to load the recommended structure; "
-                    "(3) draft a COMPLETE SKILL.md: pushy description "
-                    "(what + when + trigger phrases), purpose, procedure "
-                    "with reasons, explicit output template, at least one "
-                    "worked example, edge-case/failure behavior; (4) "
-                    "optionally validate_skill (also reports missing "
-                    "sections); (5) call this tool.\n\n"
-                    "A bare checklist makes a schematic, weak skill — "
-                    "include examples and an output template.\n\n"
+                    "MANDATORY WORKFLOW: (1) interview the user — what it "
+                    "does, when to trigger, output format, edge cases; "
+                    "(2) call get_skill_guidelines to load the recommended "
+                    "structure; (3) draft a COMPLETE SKILL.md: pushy "
+                    "description (what + when + trigger phrases), purpose, "
+                    "procedure with reasons, explicit output template, at "
+                    "least one worked example, edge-case/failure behavior; "
+                    "(4) call this tool.\n\n"
+                    "QUALITY GATE: if the draft is missing recommended "
+                    "sections, this tool does NOT save — it returns the "
+                    "guidelines and you must improve the draft and call "
+                    "again. A bare checklist makes a schematic, weak skill.\n\n"
                     "Example:\n"
                     "---\n"
                     "name: my-skill\n"
@@ -989,6 +1023,16 @@ class Tools:
                             "description": (
                                 "If true and the skill id already exists, "
                                 "update it instead of failing."
+                            ),
+                            "default": False,
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": (
+                                "Bypass the quality gate and save even if "
+                                "the draft is missing recommended sections. "
+                                "Only when the user explicitly wants a "
+                                "minimal skill."
                             ),
                             "default": False,
                         },
