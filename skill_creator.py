@@ -6,7 +6,7 @@ funding_url: https://github.com/ianustec/openwebui-skill-creator
 description: Create and save Open WebUI Workspace Skills from SKILL.md (Claude-style) — interview, guidelines, draft, validate, persist private by default
 requirements: httpx, pydantic, PyYAML
 required_open_webui_version: 0.10.0
-version: 1.2.0
+version: 1.2.1
 license: MIT
 """
 
@@ -56,9 +56,18 @@ except ImportError:
 _SKILL_GUIDELINES = """\
 # How to Write a Great SKILL.md
 
-A skill is a reusable procedure the model follows when triggered. A good skill
-reads like a well-written runbook a smart colleague could follow — not a bare
-checklist. Use this structure unless the user asks otherwise.
+## What a skill is (and is not)
+
+A skill is a reusable procedure the model follows when triggered — the "how"
+(runbook, formats, criteria). It is NOT an agent/model: a Workspace Model is
+the "who" (identity, system prompt, base LLM, bound tools/knowledge/skills).
+One model can bind many skills; one skill can be reused by many models.
+
+Activation: `$skill-name` in chat, binding under Workspace → Models → Skills,
+or automatic selection when the description matches the request.
+
+A good skill reads like a well-written runbook a smart colleague could follow
+— not a bare checklist. Use this structure unless the user asks otherwise.
 
 ## Frontmatter
 
@@ -645,13 +654,15 @@ class Tools:
         __request__=None,
         __user__=None,
     ) -> str:
-        """Return the full SKILL.md writing guidelines (structure, sections,
-        examples, style rules). Call this BEFORE drafting a skill so the draft
-        follows best practices instead of a bare checklist."""
+        """Return the official skill-writing knowledge: what a skill is, how
+        it differs from a model/agent, the full SKILL.md structure, and the
+        style rules. Call this for ANY question about skills — and always
+        before drafting one — so the answer follows the official guidelines
+        instead of improvising."""
         return (
-            "[TOOL_RESULT — these are the skill-writing guidelines. Follow "
-            "them when drafting the SKILL.md. Do NOT paste them verbatim to "
-            "the user unless they ask to see the guidelines.]\n\n"
+            "[TOOL_RESULT — these are the official skill guidelines. Base "
+            "your answer (or your draft) on them. Do NOT paste them verbatim "
+            "unless the user asks to see the full guidelines.]\n\n"
             + _SKILL_GUIDELINES
         )
 
@@ -1102,12 +1113,22 @@ class Tools:
             "function": {
                 "name": "get_skill_guidelines",
                 "description": (
-                    "Return the full SKILL.md writing guidelines: required "
-                    "frontmatter, recommended body sections (purpose, "
-                    "procedure with reasons, output template, worked "
-                    "examples, edge cases, quality checklist), and style "
-                    "rules. ALWAYS call this before drafting a new skill so "
-                    "the result is complete, not schematic."
+                    "The official knowledge base about Open WebUI Workspace "
+                    "Skills: what a skill is, how it differs from a "
+                    "model/agent, how to create/structure/activate one, the "
+                    "SKILL.md format (frontmatter: name, description), the "
+                    "recommended body sections (purpose, procedure with "
+                    "reasons, output template, worked examples, edge cases, "
+                    "quality checklist) and the style rules.\n\n"
+                    "CALL THIS TOOL whenever the user mentions skills — "
+                    "e.g. \"what is a skill\", \"how do I create a skill\", "
+                    "\"skill vs agent\", \"skill structure\", \"SKILL.md\", "
+                    "\"skill examples\", \"best practices\", \"improve my "
+                    "skill\" — even if they are only asking a question and "
+                    "not creating anything yet. Answer FROM the guidelines "
+                    "instead of improvising. Also ALWAYS call it before "
+                    "drafting or updating any skill (create_skill enforces "
+                    "this with a quality gate)."
                 ),
                 "parameters": {
                     "type": "object",
