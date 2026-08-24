@@ -3,10 +3,10 @@ title: Skill Creator
 author: IANUSTEC
 author_url: https://ianustec.com
 funding_url: https://github.com/ianustec/openwebui-skill-creator
-description: Create and save Open WebUI Workspace Skills from SKILL.md (Claude-style) — interview, draft, validate, persist private by default
+description: Create and save Open WebUI Workspace Skills from SKILL.md (Claude-style) — interview, guidelines, draft, validate, persist private by default
 requirements: httpx, pydantic, PyYAML
 required_open_webui_version: 0.10.0
-version: 1.0.0
+version: 1.1.0
 license: MIT
 """
 
@@ -47,6 +47,115 @@ try:
 except ImportError:
     yaml = None  # type: ignore[assignment]
     _HAS_YAML = False
+
+
+# ============================================================================
+# Skill writing guidelines (adapted from Anthropic skill-creator best practices)
+# ============================================================================
+
+_SKILL_GUIDELINES = """\
+# How to Write a Great SKILL.md
+
+A skill is a reusable procedure the model follows when triggered. A good skill
+reads like a well-written runbook a smart colleague could follow — not a bare
+checklist. Use this structure unless the user asks otherwise.
+
+## Frontmatter
+
+- **name** (required): kebab-case identifier, e.g. `consulta-codici-fiscali`.
+- **description** (required): the PRIMARY triggering mechanism. It must state
+  BOTH what the skill does AND when to use it. Be deliberately "pushy" —
+  models tend to under-trigger skills, so list concrete trigger phrases,
+  synonyms, and near-miss contexts. Example:
+  "Answers questions about fiscal and civil codes using ONLY the /CODICI/
+  folder. Use whenever the user asks for legal references, article numbers,
+  TUIR, IVA rules, 'cosa dice il codice', 'articolo X', or normativa — even
+  if they don't say 'skill' or 'codici'."
+- **tags** (optional): short labels for grouping.
+
+## Recommended body sections
+
+Adapt names to the domain, but aim to cover all of these:
+
+1. **Purpose / When to use** — one short paragraph. What outcome the user
+   gets, and the situations where this skill applies (and where it does NOT).
+2. **Inputs** — what the user is expected to provide (question, file, data,
+   period, entity…). Note what to do when inputs are missing: ask, don't guess.
+3. **Procedure** — numbered steps. For each step say WHAT to do and WHY it
+   matters (models follow reasoning better than bare MUSTs). If the skill
+   calls tools, name the exact tool and its key arguments, and describe how
+   to handle empty/error results.
+4. **Rules & constraints** — the hard boundaries (e.g. "only use files under
+   /CODICI/", "never invent article numbers"). Explain WHY each rule exists
+   so the model can apply judgment at the edges instead of blindly obeying.
+5. **Output format** — an exact template the model must fill, e.g.:
+
+   ## Answer template
+   ALWAYS answer with this structure:
+   - **Risposta** — direct answer in 2-4 sentences
+   - **Riferimento** — article/norm with exact citation
+   - **Fonte** — source file with link
+   - **Note** — caveats or related provisions (optional)
+
+6. **Examples** — at least one, ideally two, worked input/output pairs:
+
+   **Example 1**
+   Input: "Cosa dice il TUIR sulle plusvalenze?"
+   Output: **Risposta** … **Riferimento** Art. 68 TUIR … **Fonte** …
+
+7. **Edge cases & failure handling** — what to do when: nothing is found
+   ("say you found nothing in the authorized sources, don't improvise"),
+   the question is out of scope, the input is ambiguous (ask one targeted
+   clarifying question), or a tool errors.
+8. **Quality checklist** (optional but valuable) — 3-5 questions the model
+   asks itself before answering: "Did I only use authorized sources? Did I
+   cite the exact article? Is the output in the required template?"
+
+## Style rules
+
+- Imperative mood ("Search…", "Filter…", "Answer with…"), not descriptive.
+- Explain the WHY behind important steps instead of stacking ALL-CAPS MUSTs —
+  a model that understands the reason generalizes; a model with only rigid
+  rules breaks on the first unexpected input.
+- Keep the body under ~500 lines. If you need more, split detail into clear
+  sections with headings so the model can navigate.
+- Write in the user's language (match the skill's domain language).
+- Do not include secrets, internal URLs, or environment-specific paths unless
+  the user explicitly provides them — and then mark them clearly.
+
+## Before saving
+
+Run through this checklist mentally and fix the draft if anything is missing:
+- [ ] description states WHAT + WHEN (with trigger phrases)
+- [ ] procedure steps have a reason, not just an order
+- [ ] output format is an explicit template
+- [ ] at least one worked example (input → output)
+- [ ] failure/empty-result behavior is defined
+- [ ] rules explain why, not only what
+"""
+
+_GUIDELINES_SECTION_HINTS = (
+    ("purpose", ("purpose", "when to use", "scopo", "quando usar")),
+    ("procedure", ("procedure", "step", "workflow", "process", "procedura")),
+    ("output format", ("output", "template", "format", "struttura")),
+    ("examples", ("example", "esempio", "esempi", "input:", "output:")),
+    ("edge cases", ("edge case", "error", "fallback", "not found",
+                    "non trov", "fuori scope", "out of scope", "failure")),
+)
+
+
+def _analyze_skill_body(body: str) -> list[str]:
+    """Soft quality warnings: which recommended sections seem missing."""
+    low = (body or "").lower()
+    warnings: list[str] = []
+    if not low.strip():
+        return warnings
+    for label, hints in _GUIDELINES_SECTION_HINTS:
+        if not any(h in low for h in hints):
+            warnings.append(f"no clear '{label}' section")
+    if "example" not in low and "esempi" not in low and "esempio" not in low:
+        warnings.append("no worked example (input → output)")
+    return warnings
 
 
 # ============================================================================
@@ -253,6 +362,13 @@ def _validate_skill_spec(spec: dict) -> tuple[bool, list[str]]:
         )
 
     return (len(errors) == 0, errors)
+
+
+def _validate_with_warnings(spec: dict) -> tuple[bool, list[str], list[str]]:
+    """Hard validation + soft quality warnings (missing recommended sections)."""
+    ok, errors = _validate_skill_spec(spec)
+    warnings = _analyze_skill_body(spec.get("content") or "")
+    return ok, errors, warnings
 
 
 def _to_skill_form(spec: dict, *, is_active: bool, private: bool) -> dict:
@@ -490,6 +606,7 @@ class Tools:
             self._descriptor_create(),
             self._descriptor_update(),
             self._descriptor_validate(),
+            self._descriptor_guidelines(),
         ]
 
     # ── Status helpers ───────────────────────────────────────────────────────
@@ -512,6 +629,23 @@ class Tools:
         except Exception:
             pass
 
+    # ── Public: get_skill_guidelines ─────────────────────────────────────────
+    async def get_skill_guidelines(
+        self,
+        __event_emitter__=None,
+        __request__=None,
+        __user__=None,
+    ) -> str:
+        """Return the full SKILL.md writing guidelines (structure, sections,
+        examples, style rules). Call this BEFORE drafting a skill so the draft
+        follows best practices instead of a bare checklist."""
+        return (
+            "[TOOL_RESULT — these are the skill-writing guidelines. Follow "
+            "them when drafting the SKILL.md. Do NOT paste them verbatim to "
+            "the user unless they ask to see the guidelines.]\n\n"
+            + _SKILL_GUIDELINES
+        )
+
     # ── Public: validate_skill ───────────────────────────────────────────────
     async def validate_skill(
         self,
@@ -522,7 +656,8 @@ class Tools:
     ) -> str:
         """Validate a SKILL.md (or JSON) draft without saving.
 
-        Use this to check frontmatter/body before create_skill.
+        Checks frontmatter and reports which recommended sections are missing
+        (purpose, procedure, output format, examples, edge cases).
         Does NOT write to OpenWebUI.
 
         Args:
@@ -537,13 +672,22 @@ class Tools:
         except Exception as exc:
             return _error_reply(f"Parse error: {exc}")
 
-        ok, errors = _validate_skill_spec(spec)
+        ok, errors, warnings = _validate_with_warnings(spec)
         if not ok:
             return (
                 "[TOOL_RESULT — use the text below as your final reply, "
                 "verbatim.]\n\n"
                 "Skill draft is **invalid**:\n"
                 + "\n".join(f"- {e}" for e in errors)
+            )
+        warn_block = ""
+        if warnings:
+            warn_block = (
+                "\n**Completeness warnings** (skill works but may feel "
+                "schematic — consider adding):\n"
+                + "\n".join(f"- {w}" for w in warnings)
+                + "\n\nCall `get_skill_guidelines` for the recommended "
+                "structure, then improve the draft before saving.\n"
             )
         return (
             "[TOOL_RESULT — use the text below as your final reply, "
@@ -553,7 +697,8 @@ class Tools:
             f"- name: {spec['name']}\n"
             f"- description: {spec['description'][:200]}"
             f"{'…' if len(spec['description']) > 200 else ''}\n"
-            f"- body lines: {spec['content'].count(chr(10)) + 1}\n\n"
+            f"- body lines: {spec['content'].count(chr(10)) + 1}\n"
+            f"{warn_block}\n"
             "Call `create_skill` with the same content to save it "
             "(private by default)."
         )
@@ -574,13 +719,16 @@ class Tools:
 
         WORKFLOW (skill-creator style):
         1. Interview the user: what should the skill enable? when should it
-           trigger? expected output format?
-        2. Draft SKILL.md with YAML frontmatter (name + description required).
-           Make the description "pushy": state WHAT it does AND WHEN to use
-           it (trigger phrases). Keep the body under ~500 lines; imperative
-           tone; include examples / output templates.
-        3. Optionally call validate_skill first.
-        4. Call THIS tool to save. Confirm the returned id to the user.
+           trigger? expected output format? edge cases?
+        2. Call get_skill_guidelines() to load the recommended SKILL.md
+           structure (purpose, procedure, output format, examples, edge
+           cases) — a bare checklist makes a schematic, weak skill.
+        3. Draft SKILL.md following those guidelines: pushy description
+           (what + when + trigger phrases), imperative body with reasons,
+           an explicit output template, at least one worked example, and
+           failure/empty-result behavior.
+        4. Optionally call validate_skill — it also reports missing sections.
+        5. Call THIS tool to save. Confirm the returned id to the user.
 
         Example content::
 
@@ -593,8 +741,17 @@ class Tools:
 
             # Code Review Guidelines
 
-            1. Check correctness and edge cases
-            2. Verify tests and error handling
+            ## Purpose
+            ...
+
+            ## Procedure
+            1. Check correctness and edge cases — because ...
+            2. Verify tests and error handling — because ...
+
+            ## Output format
+            ...
+
+            ## Examples
             ...
 
         Args:
@@ -614,7 +771,7 @@ class Tools:
         except Exception as exc:
             return _error_reply(f"Parse error: {exc}")
 
-        ok, errors = _validate_skill_spec(spec)
+        ok, errors, warnings = _validate_with_warnings(spec)
         if not ok:
             return _error_reply(
                 "Validation failed:\n" + "\n".join(f"- {e}" for e in errors)
@@ -672,6 +829,14 @@ class Tools:
             private=private,
             active=active,
         )
+        if warnings:
+            reply += (
+                "\n[NOTE FOR ASSISTANT — mention briefly to the user] The "
+                "saved skill is missing recommended sections: "
+                + "; ".join(warnings)
+                + ". Offer to improve it with update_skill after loading "
+                "get_skill_guidelines.\n"
+            )
         await self._emit_message(
             __event_emitter__,
             f"\n\nSkill created: **{spec['name']}** (`{spec['id']}`) — "
@@ -789,10 +954,17 @@ class Tools:
                     "SKILL.md (YAML frontmatter + markdown body). "
                     "Private by default. ALWAYS call this after drafting — "
                     "never only paste SKILL.md in chat.\n\n"
-                    "Before calling: interview the user (what / when to "
-                    "trigger / output format), write a pushy description "
-                    "(what + when), keep body under ~500 lines, imperative "
-                    "tone with examples.\n\n"
+                    "WORKFLOW: (1) interview the user — what it does, when "
+                    "to trigger, output format, edge cases; (2) call "
+                    "get_skill_guidelines to load the recommended structure; "
+                    "(3) draft a COMPLETE SKILL.md: pushy description "
+                    "(what + when + trigger phrases), purpose, procedure "
+                    "with reasons, explicit output template, at least one "
+                    "worked example, edge-case/failure behavior; (4) "
+                    "optionally validate_skill (also reports missing "
+                    "sections); (5) call this tool.\n\n"
+                    "A bare checklist makes a schematic, weak skill — "
+                    "include examples and an output template.\n\n"
                     "Example:\n"
                     "---\n"
                     "name: my-skill\n"
@@ -862,7 +1034,9 @@ class Tools:
                 "name": "validate_skill",
                 "description": (
                     "Validate a SKILL.md draft (frontmatter + body) without "
-                    "saving. Call before create_skill if unsure."
+                    "saving. Also reports which recommended sections are "
+                    "missing (purpose, procedure, output format, examples, "
+                    "edge cases). Call before create_skill."
                 ),
                 "parameters": {
                     "type": "object",
@@ -873,6 +1047,28 @@ class Tools:
                         },
                     },
                     "required": ["content"],
+                },
+            },
+        }
+
+    @staticmethod
+    def _descriptor_guidelines() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "get_skill_guidelines",
+                "description": (
+                    "Return the full SKILL.md writing guidelines: required "
+                    "frontmatter, recommended body sections (purpose, "
+                    "procedure with reasons, output template, worked "
+                    "examples, edge cases, quality checklist), and style "
+                    "rules. ALWAYS call this before drafting a new skill so "
+                    "the result is complete, not schematic."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
                 },
             },
         }
